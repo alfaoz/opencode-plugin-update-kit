@@ -24,6 +24,13 @@ export interface AutoUpdateOptions {
   toastDuration?: number
   /** Skip toast notification. Default: false */
   skipToast?: boolean
+  /**
+   * Minimum time between npm registry checks, in ms. The kit records the last
+   * check time and skips the network request if called again within this
+   * window (e.g. several opencode restarts in a row). Default: 5s. Set 0 to
+   * check on every startup.
+   */
+  checkIntervalMs?: number
 }
 
 // ── Concurrency guard ──────────────────────────────────────────────
@@ -70,29 +77,71 @@ export function currentVersion(
     }
   } catch {}
 
-  // Fallback: check opencode cache
+  // Fallback: check opencode cache. Cache dirs are named "<pkgName>@<version>",
+  // so match exactly or by the "<pkgName>@" prefix — a bare startsWith would
+  // also match unrelated packages whose name begins with pkgName (e.g.
+  // "foo" matching "foobar"). When several versions are cached, return the
+  // greatest rather than whichever the directory listing happens to yield first.
   try {
     const cacheDir = path.join(os.homedir(), ".cache/opencode/packages")
     if (fs.existsSync(cacheDir)) {
+      let best: string | null = null
       for (const sub of fs.readdirSync(cacheDir)) {
-        if (sub.startsWith(pkgName)) {
-          const pkgPath = path.join(
-            cacheDir,
-            sub,
-            "node_modules",
-            pkgName,
-            "package.json",
-          )
-          try {
-            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"))
-            if (pkg.version) return pkg.version
-          } catch {}
-        }
+        if (sub !== pkgName && !sub.startsWith(`${pkgName}@`)) continue
+        const pkgPath = path.join(
+          cacheDir,
+          sub,
+          "node_modules",
+          pkgName,
+          "package.json",
+        )
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"))
+          if (pkg.version && (!best || semverGt(pkg.version, best))) {
+            best = pkg.version
+          }
+        } catch {}
       }
+      if (best) return best
     }
   } catch {}
 
   return null
+}
+
+// ── Persisted state (throttle + install stamp) ─────────────────────
+
+interface UpdateState {
+  /** Epoch ms of the last npm registry check. */
+  lastCheck?: number
+  /** Version most recently installed by this kit (awaiting restart). */
+  installed?: string
+}
+
+function statePath(pkgName: string): string {
+  return path.join(
+    os.homedir(),
+    ".cache/opencode",
+    `${pkgName}.update-kit.json`,
+  )
+}
+
+function readState(pkgName: string): UpdateState {
+  try {
+    return JSON.parse(fs.readFileSync(statePath(pkgName), "utf8")) as UpdateState
+  } catch {
+    return {}
+  }
+}
+
+function writeState(pkgName: string, state: UpdateState): void {
+  try {
+    const p = statePath(pkgName)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, JSON.stringify(state))
+  } catch {
+    // state is best-effort; failing just means we recheck next time
+  }
 }
 
 // ── Default logger ─────────────────────────────────────────────────
@@ -144,6 +193,7 @@ export async function autoUpdate(
     registryUrl,
     skipToast = false,
     toastDuration = 86_400_000,
+    checkIntervalMs = 5_000,
   } = opts
 
   const log = opts.log ?? createLogger(client, pkgName)
@@ -153,6 +203,18 @@ export async function autoUpdate(
     const current = currentVersion(pkgName, importMeta)
     if (!current) {
       log(`could not determine current version for "${pkgName}"`, "warn")
+      return
+    }
+
+    const state = readState(pkgName)
+
+    // Throttle: skip the registry round-trip if we checked recently (e.g.
+    // several restarts in quick succession).
+    if (
+      checkIntervalMs > 0 &&
+      state.lastCheck &&
+      Date.now() - state.lastCheck < checkIntervalMs
+    ) {
       return
     }
 
@@ -172,7 +234,15 @@ export async function autoUpdate(
       return
     }
 
+    // Record the check regardless of outcome so the throttle holds.
+    writeState(pkgName, { ...state, lastCheck: Date.now() })
+
     if (!semverGt(latest, current)) return
+
+    // Already installed this version on a prior startup; it just needs a
+    // restart to take effect. Don't re-run `opencode plugin --force` (and
+    // re-toast) on every launch until then.
+    if (state.installed === latest) return
 
     log(`update available: ${current} -> ${latest}`, "info")
 
@@ -192,6 +262,10 @@ export async function autoUpdate(
         return
       }
     }
+
+    // Stamp the installed version so we don't reinstall it on the next
+    // startup (the running code stays on the old version until restart).
+    writeState(pkgName, { ...state, lastCheck: Date.now(), installed: latest })
 
     log(
       `update applied: ${current} -> ${latest}; restart opencode to load`,

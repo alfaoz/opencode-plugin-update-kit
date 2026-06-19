@@ -42,6 +42,7 @@ That's it. On every startup it checks npm for a newer version and runs `opencode
 | `opencodeBin` | `string` | `OPENCODE_BIN` env or `~/.opencode/bin/opencode` | Custom opencode binary path |
 | `toastDuration` | `number` | `86_400_000` (24h) | Toast duration in ms. `0` for app default. |
 | `skipToast` | `boolean` | `false` | Disable toast notification |
+| `checkIntervalMs` | `number` | `5_000` (5s) | Minimum time between npm registry checks. Skips the network request if called again within the window. `0` to check on every startup. |
 
 ### `currentVersion(pkgName, importMeta)`
 
@@ -64,10 +65,12 @@ if (semverGt("2.0.0", version)) {
 ## How it works
 
 1. **Version detection** — walks up from the caller's file to find `package.json` with a matching `name`
-2. **Registry check** — fetches `https://registry.npmjs.org/{pkgName}/latest` 
-3. **Semver compare** — if latest > current, proceeds
-4. **Sequential install** — all updates queue through a single promise chain, so multiple plugins never race on the config file or npm cache
-5. **Notification** — logs the result and shows a persistent toast asking the user to restart
+2. **Throttle** — skips the registry round-trip if it checked within `checkIntervalMs` (default 5s); the last-check time is persisted to `~/.cache/opencode/{pkgName}.update-kit.json`
+3. **Registry check** — fetches `https://registry.npmjs.org/{pkgName}/latest`
+4. **Semver compare** — if latest > current, proceeds
+5. **Install stamp** — records the installed version so it doesn't reinstall the same version on every startup while you wait to restart (the running code stays on the old version until then)
+6. **Sequential install** — all updates queue through a single promise chain, so multiple plugins never race on the config file or npm cache
+7. **Notification** — logs the result and shows a persistent toast asking the user to restart
 
 ## Concurrency
 
