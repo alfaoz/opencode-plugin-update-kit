@@ -210,9 +210,6 @@ async function osNotify(title: string, message: string): Promise<boolean> {
  * the update lands on the next restart.
  */
 function rewriteConfigSpec(pkgName: string, latest: string): boolean {
-  const escaped = pkgName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const pattern = new RegExp(`(["'])${escaped}(?:@[^"']*)?(["'])`, "g")
-
   const candidates: string[] = []
   if (process.env.OPENCODE_CONFIG) candidates.push(process.env.OPENCODE_CONFIG)
   const configHome =
@@ -224,13 +221,217 @@ function rewriteConfigSpec(pkgName: string, latest: string): boolean {
     try {
       if (!fs.existsSync(p)) continue
       const text = fs.readFileSync(p, "utf8")
-      const next = text.replace(pattern, `$1${pkgName}@${latest}$2`)
+      const next = rewritePluginArraySpecs(text, pkgName, latest)
       if (next === text) continue
       fs.writeFileSync(p, next)
       return true
     } catch {}
   }
   return false
+}
+
+function skipSpaceAndComments(text: string, index: number): number {
+  let i = index
+  while (i < text.length) {
+    if (/\s/.test(text[i]!)) {
+      i++
+      continue
+    }
+    if (text.startsWith("//", i)) {
+      const end = text.indexOf("\n", i + 2)
+      i = end === -1 ? text.length : end + 1
+      continue
+    }
+    if (text.startsWith("/*", i)) {
+      const end = text.indexOf("*/", i + 2)
+      i = end === -1 ? text.length : end + 2
+      continue
+    }
+    break
+  }
+  return i
+}
+
+function readQuotedString(
+  text: string,
+  index: number,
+): { end: number; quote: string; value: string } | null {
+  const quote = text[index]
+  if (quote !== '"' && quote !== "'") return null
+
+  let raw = ""
+  let i = index + 1
+  while (i < text.length) {
+    const ch = text[i]!
+    if (ch === "\\") {
+      raw += ch
+      if (i + 1 < text.length) raw += text[i + 1]!
+      i += 2
+      continue
+    }
+    if (ch === quote) {
+      let value = raw
+      try {
+        value = JSON.parse(`"${raw.replace(/"/g, '\\"')}"`)
+      } catch {}
+      return { end: i + 1, quote, value }
+    }
+    raw += ch
+    i++
+  }
+  return null
+}
+
+function findMatchingBracket(text: string, openIndex: number): number {
+  let depth = 0
+  let i = openIndex
+  while (i < text.length) {
+    if (text.startsWith("//", i)) {
+      const end = text.indexOf("\n", i + 2)
+      i = end === -1 ? text.length : end + 1
+      continue
+    }
+    if (text.startsWith("/*", i)) {
+      const end = text.indexOf("*/", i + 2)
+      i = end === -1 ? text.length : end + 2
+      continue
+    }
+    const quoted = readQuotedString(text, i)
+    if (quoted) {
+      i = quoted.end
+      continue
+    }
+    const ch = text[i]
+    if (ch === "[") depth++
+    if (ch === "]") {
+      depth--
+      if (depth === 0) return i
+    }
+    i++
+  }
+  return -1
+}
+
+function quoteString(value: string, quote: string): string {
+  const quoted = JSON.stringify(value)
+  if (quote === '"') return quoted
+  return `'${quoted.slice(1, -1).replace(/'/g, "\\'")}'`
+}
+
+function rewritePluginEntries(
+  text: string,
+  pkgName: string,
+  latest: string,
+): string {
+  let out = ""
+  let cursor = 0
+  let i = 0
+  let depth = 0
+  const elementIndex: number[] = []
+  const specifier = `${pkgName}@${latest}`
+
+  while (i < text.length) {
+    if (text.startsWith("//", i)) {
+      const end = text.indexOf("\n", i + 2)
+      i = end === -1 ? text.length : end + 1
+      continue
+    }
+    if (text.startsWith("/*", i)) {
+      const end = text.indexOf("*/", i + 2)
+      i = end === -1 ? text.length : end + 2
+      continue
+    }
+
+    const quoted = readQuotedString(text, i)
+    if (quoted) {
+      const isPluginSpec =
+        quoted.value === pkgName || quoted.value.startsWith(`${pkgName}@`)
+      const isDirectPluginEntry = depth === 1
+      const isTupleSpecifier = depth === 2 && elementIndex[depth] === 0
+      if (isPluginSpec && (isDirectPluginEntry || isTupleSpecifier)) {
+        out += text.slice(cursor, i)
+        out += quoteString(specifier, quoted.quote)
+        cursor = quoted.end
+      }
+      i = quoted.end
+      continue
+    }
+
+    const ch = text[i]
+    if (ch === "[") {
+      depth++
+      elementIndex[depth] = 0
+    } else if (ch === "]") {
+      elementIndex[depth] = 0
+      depth--
+    } else if (ch === "," && depth > 0) {
+      elementIndex[depth] = (elementIndex[depth] ?? 0) + 1
+    }
+    i++
+  }
+
+  return out + text.slice(cursor)
+}
+
+function rewritePluginArraySpecs(
+  text: string,
+  pkgName: string,
+  latest: string,
+): string {
+  let out = ""
+  let cursor = 0
+  let i = 0
+
+  while (i < text.length) {
+    if (text.startsWith("//", i)) {
+      const end = text.indexOf("\n", i + 2)
+      i = end === -1 ? text.length : end + 1
+      continue
+    }
+    if (text.startsWith("/*", i)) {
+      const end = text.indexOf("*/", i + 2)
+      i = end === -1 ? text.length : end + 2
+      continue
+    }
+
+    const quoted = readQuotedString(text, i)
+    if (!quoted) {
+      i++
+      continue
+    }
+
+    if (quoted.value !== "plugin") {
+      i = quoted.end
+      continue
+    }
+
+    const colon = skipSpaceAndComments(text, quoted.end)
+    if (text[colon] !== ":") {
+      i = quoted.end
+      continue
+    }
+    const valueStart = skipSpaceAndComments(text, colon + 1)
+    if (text[valueStart] !== "[") {
+      i = quoted.end
+      continue
+    }
+    const valueEnd = findMatchingBracket(text, valueStart)
+    if (valueEnd === -1) {
+      i = quoted.end
+      continue
+    }
+
+    out += text.slice(cursor, valueStart)
+    out += rewritePluginEntries(
+      text.slice(valueStart, valueEnd + 1),
+      pkgName,
+      latest,
+    )
+    cursor = valueEnd + 1
+    i = valueEnd + 1
+  }
+
+  return out + text.slice(cursor)
 }
 
 // ── Default logger ─────────────────────────────────────────────────
