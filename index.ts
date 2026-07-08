@@ -1,14 +1,18 @@
 import path from "path"
 import os from "os"
 import fs from "fs"
+import { spawn } from "child_process"
 
 export interface AutoUpdateOptions {
   /** npm package name (e.g. "my-plugin") */
   pkgName: string
   /** opencode client from plugin context */
   client: any
-  /** Bun shell ($) from plugin context */
-  $: any
+  /**
+   * Bun shell ($) from plugin context. Optional: the desktop app's server
+   * runs on Node and passes no shell — the kit falls back to child_process.
+   */
+  $?: any
   /**
    * Pass `import.meta` from your plugin entry file so the kit
    * can locate your package.json for version detection.
@@ -24,6 +28,13 @@ export interface AutoUpdateOptions {
   toastDuration?: number
   /** Skip toast notification. Default: false */
   skipToast?: boolean
+  /**
+   * Skip the OS-native notification shown when running under the opencode
+   * desktop app. The desktop UI does not render TUI toasts, so the kit sends
+   * a system notification instead (osascript / notify-send / PowerShell).
+   * Default: false.
+   */
+  skipOsNotification?: boolean
   /**
    * Minimum time between npm registry checks, in ms. The kit records the last
    * check time and skips the network request if called again within this
@@ -144,6 +155,84 @@ function writeState(pkgName: string, state: UpdateState): void {
   }
 }
 
+// ── Process + notification helpers ─────────────────────────────────
+
+function spawnQuiet(cmd: string, args: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn(cmd, args, { stdio: "ignore" })
+      p.on("error", () => resolve(false))
+      p.on("close", (code) => resolve(code === 0))
+    } catch {
+      resolve(false)
+    }
+  })
+}
+
+/**
+ * OS-native notification. Used under the desktop app, whose UI does not
+ * render TUI toasts — the plugin host process runs as the user, so we can
+ * post a system notification directly. Best-effort on every platform.
+ */
+async function osNotify(title: string, message: string): Promise<boolean> {
+  if (process.platform === "darwin") {
+    const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+    return spawnQuiet("osascript", [
+      "-e",
+      `display notification "${esc(message)}" with title "${esc(title)}"`,
+    ])
+  }
+  if (process.platform === "win32") {
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/'/g, "''")
+    const script = [
+      "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+      "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument",
+      `$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>${esc(title)}</text><text>${esc(message)}</text></binding></visual></toast>')`,
+      "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('opencode').Show([Windows.UI.Notifications.ToastNotification]::new($xml))",
+    ].join("; ")
+    return spawnQuiet("powershell", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-WindowStyle",
+      "Hidden",
+      "-Command",
+      script,
+    ])
+  }
+  return spawnQuiet("notify-send", [title, message])
+}
+
+/**
+ * Last-resort update path when no opencode CLI binary is available (e.g. a
+ * desktop-only install): rewrite the plugin spec in the opencode config to
+ * the new version. opencode installs config-pinned versions at startup, so
+ * the update lands on the next restart.
+ */
+function rewriteConfigSpec(pkgName: string, latest: string): boolean {
+  const escaped = pkgName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const pattern = new RegExp(`(["'])${escaped}(?:@[^"']*)?(["'])`, "g")
+
+  const candidates: string[] = []
+  if (process.env.OPENCODE_CONFIG) candidates.push(process.env.OPENCODE_CONFIG)
+  const configHome =
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config")
+  candidates.push(path.join(configHome, "opencode", "opencode.jsonc"))
+  candidates.push(path.join(configHome, "opencode", "opencode.json"))
+
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue
+      const text = fs.readFileSync(p, "utf8")
+      const next = text.replace(pattern, `$1${pkgName}@${latest}$2`)
+      if (next === text) continue
+      fs.writeFileSync(p, next)
+      return true
+    } catch {}
+  }
+  return false
+}
+
 // ── Default logger ─────────────────────────────────────────────────
 
 function createLogger(
@@ -252,14 +341,33 @@ export async function autoUpdate(
       process.env.OPENCODE_BIN ??
       path.join(os.homedir(), ".opencode/bin/opencode")
 
+    const install = async (cmd: string) => {
+      if ($) {
+        await $`${cmd} plugin ${specifier} --force --global`.quiet()
+        return
+      }
+      const ok = await spawnQuiet(cmd, [
+        "plugin",
+        specifier,
+        "--force",
+        "--global",
+      ])
+      if (!ok) throw new Error(`${cmd} plugin install failed`)
+    }
+
     try {
-      await $`${bin} plugin ${specifier} --force --global`.quiet()
+      await install(bin)
     } catch {
       try {
-        await $`opencode plugin ${specifier} --force --global`.quiet()
+        await install("opencode")
       } catch (e2: any) {
-        log(`update failed: ${e2?.message ?? e2}`, "warn")
-        return
+        // No usable CLI (desktop-only installs don't ship one). Point the
+        // config at the new version instead; opencode installs it on the
+        // next startup.
+        if (!rewriteConfigSpec(pkgName, latest)) {
+          log(`update failed: ${e2?.message ?? e2}`, "warn")
+          return
+        }
       }
     }
 
@@ -272,11 +380,13 @@ export async function autoUpdate(
       "info",
     )
 
+    const notice = `${pkgName} updated to ${latest}, restart opencode to apply`
+
     if (!skipToast) {
       try {
         await client?.tui?.showToast?.({
           body: {
-            message: `${pkgName} updated to ${latest}, restart opencode to apply`,
+            message: notice,
             variant: "success",
             duration: toastDuration,
           },
@@ -284,6 +394,16 @@ export async function autoUpdate(
       } catch {
         // toast is best-effort
       }
+    }
+
+    // The desktop app's UI ignores TUI toasts; its host process sets
+    // OPENCODE_CLIENT=desktop, so surface the update as a system
+    // notification there instead.
+    if (
+      !opts.skipOsNotification &&
+      process.env.OPENCODE_CLIENT === "desktop"
+    ) {
+      await osNotify("opencode", notice)
     }
   }
 

@@ -1,7 +1,7 @@
 {
   "name": "opencode-plugin-update-kit",
-  "version": "0.2.0",
-  "description": "Auto-update kit for opencode plugins — detects new versions, installs them, and notifies the user. Handles concurrency when multiple plugins use it.",
+  "version": "0.3.0",
+  "description": "Auto-update kit for opencode plugins \u2014 detects new versions, installs them, and notifies the user. Handles concurrency when multiple plugins use it.",
   "type": "module",
   "main": "index.ts",
   "exports": {
