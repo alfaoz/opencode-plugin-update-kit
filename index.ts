@@ -155,12 +155,79 @@ function writeState(pkgName: string, state: UpdateState): void {
   }
 }
 
+// ── opencode CLI resolution (Windows-aware) ─────────────────────────
+
+export interface SpawnSpec {
+  cmd: string
+  args: string[]
+  options: { windowsVerbatimArguments?: boolean }
+}
+
+/**
+ * Resolve how to spawn the opencode CLI portably.
+ *
+ * On POSIX this is a passthrough. On Windows the CLI may be a native
+ * `opencode.exe` or an npm `opencode.cmd` shim: extension-less paths do not
+ * spawn at all, and Node refuses to spawn `.cmd`/`.bat` files directly
+ * (CVE-2024-27980), so those are routed through `cmd.exe` with batch-style
+ * argument quoting.
+ */
+export function opencodeSpawnSpec(bin: string, args: string[]): SpawnSpec {
+  if (process.platform !== "win32") return { cmd: bin, args, options: {} }
+
+  let target = bin
+  if (!/\.(exe|cmd|bat)$/i.test(target)) {
+    if (target.includes("/") || target.includes("\\")) {
+      for (const ext of [".exe", ".cmd", ".bat"]) {
+        if (fs.existsSync(target + ext)) {
+          target += ext
+          break
+        }
+      }
+    } else {
+      target = findOnPath(target) ?? target
+    }
+  }
+
+  if (/\.(cmd|bat)$/i.test(target)) {
+    // cmd.exe does not follow CreateProcess quoting rules, so build the
+    // command line ourselves: quote anything with spaces/metachars, double
+    // inner quotes (batch style), and disable Node's own escaping.
+    const quote = (s: string) =>
+      /[\s"&|<>^()]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+    const line = [target, ...args].map(quote).join(" ")
+    return {
+      cmd: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", `"${line}"`],
+      options: { windowsVerbatimArguments: true },
+    }
+  }
+  return { cmd: target, args, options: {} }
+}
+
+function findOnPath(name: string): string | null {
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue
+    for (const ext of [".exe", ".cmd", ".bat"]) {
+      const p = path.join(dir, name + ext)
+      try {
+        if (fs.existsSync(p)) return p
+      } catch {}
+    }
+  }
+  return null
+}
+
 // ── Process + notification helpers ─────────────────────────────────
 
-function spawnQuiet(cmd: string, args: string[]): Promise<boolean> {
+function spawnQuiet(
+  cmd: string,
+  args: string[],
+  extra?: { windowsVerbatimArguments?: boolean },
+): Promise<boolean> {
   return new Promise((resolve) => {
     try {
-      const p = spawn(cmd, args, { stdio: "ignore" })
+      const p = spawn(cmd, args, { stdio: "ignore", ...extra })
       p.on("error", () => resolve(false))
       p.on("close", (code) => resolve(code === 0))
     } catch {
@@ -543,16 +610,19 @@ export async function autoUpdate(
       path.join(os.homedir(), ".opencode/bin/opencode")
 
     const install = async (cmd: string) => {
-      if ($) {
+      // Bun shell resolves commands itself, but does not handle Windows
+      // .exe/.cmd shims reliably — route Windows through the spawn spec.
+      if ($ && process.platform !== "win32") {
         await $`${cmd} plugin ${specifier} --force --global`.quiet()
         return
       }
-      const ok = await spawnQuiet(cmd, [
+      const spec = opencodeSpawnSpec(cmd, [
         "plugin",
         specifier,
         "--force",
         "--global",
       ])
+      const ok = await spawnQuiet(spec.cmd, spec.args, spec.options)
       if (!ok) throw new Error(`${cmd} plugin install failed`)
     }
 
