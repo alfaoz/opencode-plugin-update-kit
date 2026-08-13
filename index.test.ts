@@ -67,6 +67,92 @@ describe("autoUpdate config fallback", () => {
   })
 })
 
+describe("install notices", () => {
+  test("toasts when the install starts and again when it finishes", async () => {
+    const pkgName = `my-plugin-${process.pid}-${Date.now()}-toast`
+    const { root, pluginDir, binDir } = makeTempPlugin(pkgName)
+    const config = path.join(root, "opencode.jsonc")
+    fs.writeFileSync(config, `{ "plugin": ["${pkgName}"] }\n`)
+
+    process.env.PATH = binDir
+    process.env.OPENCODE_CONFIG = config
+    delete process.env.OPENCODE_CLIENT
+
+    const toasts: any[] = []
+    const client = {
+      tui: {
+        showToast: async (req: any) => {
+          toasts.push(req.body)
+        },
+      },
+    }
+
+    try {
+      await autoUpdate({
+        pkgName,
+        client,
+        importMeta: { url: `file://${pluginDir}/entry.ts` } as ImportMeta,
+        registryUrl: "data:application/json,%7B%22version%22%3A%221.1.0%22%7D",
+        opencodeBin: path.join(binDir, "missing-opencode"),
+        skipOsNotification: true,
+        checkIntervalMs: 0,
+      })
+    } finally {
+      fs.rmSync(
+        path.join(os.homedir(), ".cache", "opencode", `${pkgName}.update-kit.json`),
+        { force: true },
+      )
+    }
+
+    expect(toasts).toHaveLength(2)
+    expect(toasts[0].variant).toBe("info")
+    expect(toasts[0].message).toContain("installing")
+    expect(toasts[1].variant).toBe("success")
+    expect(toasts[1].message).toContain("restart")
+  })
+
+  test("skipInstallNotice suppresses only the install-start toast", async () => {
+    const pkgName = `my-plugin-${process.pid}-${Date.now()}-skip`
+    const { root, pluginDir, binDir } = makeTempPlugin(pkgName)
+    const config = path.join(root, "opencode.jsonc")
+    fs.writeFileSync(config, `{ "plugin": ["${pkgName}"] }\n`)
+
+    process.env.PATH = binDir
+    process.env.OPENCODE_CONFIG = config
+    delete process.env.OPENCODE_CLIENT
+
+    const toasts: any[] = []
+    const client = {
+      tui: {
+        showToast: async (req: any) => {
+          toasts.push(req.body)
+        },
+      },
+    }
+
+    try {
+      await autoUpdate({
+        pkgName,
+        client,
+        importMeta: { url: `file://${pluginDir}/entry.ts` } as ImportMeta,
+        registryUrl: "data:application/json,%7B%22version%22%3A%221.1.0%22%7D",
+        opencodeBin: path.join(binDir, "missing-opencode"),
+        skipInstallNotice: true,
+        skipOsNotification: true,
+        checkIntervalMs: 0,
+      })
+    } finally {
+      fs.rmSync(
+        path.join(os.homedir(), ".cache", "opencode", `${pkgName}.update-kit.json`),
+        { force: true },
+      )
+    }
+
+    expect(toasts).toHaveLength(1)
+    expect(toasts[0].variant).toBe("success")
+  })
+})
+
 function withWin32(fn: () => void) {
   const desc = Object.getOwnPropertyDescriptor(process, "platform")!
   Object.defineProperty(process, "platform", { value: "win32" })

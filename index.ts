@@ -29,6 +29,13 @@ export interface AutoUpdateOptions {
   /** Skip toast notification. Default: false */
   skipToast?: boolean
   /**
+   * Skip the notice shown when an update is found and the background install
+   * starts. The install can briefly stall the opencode UI, so by default the
+   * kit surfaces a toast (or a system notification under the desktop app)
+   * before spawning it. Default: false.
+   */
+  skipInstallNotice?: boolean
+  /**
    * Skip the OS-native notification shown when running under the opencode
    * desktop app. The desktop UI does not render TUI toasts, so the kit sends
    * a system notification instead (osascript / notify-send / PowerShell).
@@ -549,6 +556,7 @@ export async function autoUpdate(
     importMeta,
     registryUrl,
     skipToast = false,
+    skipInstallNotice = false,
     toastDuration = 86_400_000,
     checkIntervalMs = 5_000,
   } = opts
@@ -624,6 +632,32 @@ export async function autoUpdate(
       ])
       const ok = await spawnQuiet(spec.cmd, spec.args, spec.options)
       if (!ok) throw new Error(`${cmd} plugin install failed`)
+    }
+
+    // Announce the install before it starts: `opencode plugin` can stall the
+    // UI for a while, and without this the user has no idea why. Awaited so
+    // the toast is delivered before the spawn can cause any stall.
+    if (!skipInstallNotice) {
+      const installingNotice = `${pkgName} update found (${current} -> ${latest}), installing in background…`
+      if (!skipToast) {
+        try {
+          await client?.tui?.showToast?.({
+            body: {
+              message: installingNotice,
+              variant: "info",
+              duration: 30_000,
+            },
+          })
+        } catch {
+          // toast is best-effort
+        }
+      }
+      if (
+        !opts.skipOsNotification &&
+        process.env.OPENCODE_CLIENT === "desktop"
+      ) {
+        await osNotify("opencode", installingNotice)
+      }
     }
 
     try {
