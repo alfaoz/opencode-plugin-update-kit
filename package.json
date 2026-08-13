@@ -3,6 +3,9 @@
   "version": "0.5.0",
   "description": "Auto-update kit for opencode plugins \u2014 detects new versions, installs them, and notifies the user. Handles concurrency when multiple plugins use it.",
   "type": "module",
+  "files": [
+    "index.ts"
+  ],
   "main": "index.ts",
   "exports": {
     ".": "./index.ts"
