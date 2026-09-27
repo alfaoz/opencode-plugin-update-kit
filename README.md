@@ -27,6 +27,22 @@ export default async function MyPlugin(ctx) {
 
 That's it. On every startup it checks npm for a newer version and runs `opencode plugin my-plugin@X.Y.Z --force --global` if found.
 
+### opencode v2
+
+v2 plugins export `{ id, setup }` and get no `client`. Pass `runtime: "v2"`:
+
+```ts
+export default {
+  id: "my-plugin",
+  setup: async (ctx) => {
+    autoUpdate({ pkgName: "my-plugin", importMeta: import.meta, runtime: "v2" })
+    // ...
+  },
+}
+```
+
+v2 treats exact version pins (`my-plugin@1.2.3`) as immutable and has no `opencode plugin <pkg> --global`, so the kit moves the pin in the global config instead (both the v1 `plugin` and v2 `plugins` keys, including `{ "package": … }` entries). v2 re-reads the config and reloads the plugin without a restart. An unpinned entry is left to v2 and applied with `opencode plugin update my-plugin`, run through the v2 binary itself (or `opencode2`, never a bare `opencode`, which may be v1). v2 server plugins can't show TUI toasts, so the notice is an OS notification.
+
 ## API
 
 ### `autoUpdate(options)`
@@ -34,7 +50,7 @@ That's it. On every startup it checks npm for a newer version and runs `opencode
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `pkgName` | `string` | — | Your npm package name |
-| `client` | `OpencodeClient` | — | From plugin context |
+| `client` | `OpencodeClient` | — | From plugin context (v1 only) |
 | `$` | `BunShell` | — | From plugin context |
 | `importMeta` | `ImportMeta` | — | Pass `import.meta` so the kit can find your `package.json` |
 | `log` | `(msg, level?) => void` | `client.app.log` with `console.log` fallback | Custom logger |
@@ -44,6 +60,7 @@ That's it. On every startup it checks npm for a newer version and runs `opencode
 | `skipToast` | `boolean` | `false` | Disable toast notifications |
 | `skipInstallNotice` | `boolean` | `false` | Disable the "installing in background…" notice shown when an update is found, before the install starts |
 | `skipOsNotification` | `boolean` | `false` | Disable the OS-native notification used under the desktop app (which doesn't render TUI toasts) |
+| `runtime` | `"v1" \| "v2"` | `"v1"` | Which opencode runtime loaded the plugin. See [opencode v2](#opencode-v2). |
 | `checkIntervalMs` | `number` | `5_000` (5s) | Minimum time between npm registry checks. Skips the network request if called again within the window. `0` to check on every startup. |
 
 ### `currentVersion(pkgName, importMeta)`

@@ -212,3 +212,98 @@ describe("opencodeSpawnSpec", () => {
     })
   })
 })
+
+describe("v2 runtime", () => {
+  const stateFile = (pkgName: string) =>
+    path.join(os.homedir(), ".cache", "opencode", `${pkgName}.update-kit.json`)
+
+  // Fake v2 CLI: records its argv and prints what `plugin update` would.
+  function fakeCli(binDir: string, stdout: string) {
+    const bin = path.join(binDir, "opencode2")
+    const argsFile = path.join(binDir, "args.txt")
+    fs.writeFileSync(bin, `#!/bin/sh\necho "$@" > "${argsFile}"\necho "${stdout}"\n`)
+    fs.chmodSync(bin, 0o755)
+    return { bin, argsFile }
+  }
+
+  async function run(pkgName: string, pluginDir: string, bin: string) {
+    await autoUpdate({
+      pkgName,
+      runtime: "v2",
+      importMeta: { url: `file://${pluginDir}/entry.ts` } as ImportMeta,
+      registryUrl: "data:application/json,%7B%22version%22%3A%221.1.0%22%7D",
+      opencodeBin: bin,
+      skipOsNotification: true,
+      checkIntervalMs: 0,
+    })
+  }
+
+  test("moves exact pins in plugin and plugins, leaves the rest", async () => {
+    const pkgName = `my-plugin-${process.pid}-${Date.now()}`
+    const { root, pluginDir, binDir } = makeTempPlugin(pkgName)
+    const { bin, argsFile } = fakeCli(binDir, "Updated Server plugin")
+    const config = path.join(root, "opencode.jsonc")
+    fs.writeFileSync(
+      config,
+      [
+        "{",
+        `  "plugin": ["${pkgName}@1.0.0", ["${pkgName}@1.0.0", { "label": "${pkgName}" }], "other@1.0.0"],`,
+        `  "plugins": [{ "package": "${pkgName}@1.0.0", "options": { "note": "${pkgName}@1.0.0" } }, "${pkgName}@latest"],`,
+        `  "note": "${pkgName}@1.0.0"`,
+        "}",
+        "",
+      ].join("\n"),
+    )
+    process.env.OPENCODE_CONFIG = config
+
+    try {
+      await run(pkgName, pluginDir, bin)
+      const text = fs.readFileSync(config, "utf8")
+      expect(text).toContain(
+        `"plugin": ["${pkgName}@1.1.0", ["${pkgName}@1.1.0", { "label": "${pkgName}" }], "other@1.0.0"]`,
+      )
+      expect(text).toContain(
+        `"plugins": [{ "package": "${pkgName}@1.1.0", "options": { "note": "${pkgName}@1.0.0" } }, "${pkgName}@latest"]`,
+      )
+      expect(text).toContain(`"note": "${pkgName}@1.0.0"`)
+      expect(fs.existsSync(argsFile)).toBe(false)
+      expect(JSON.parse(fs.readFileSync(stateFile(pkgName), "utf8")).installed).toBe("1.1.0")
+    } finally {
+      fs.rmSync(stateFile(pkgName), { force: true })
+    }
+  })
+
+  test("hands unpinned entries to `plugin update`", async () => {
+    const pkgName = `my-plugin-${process.pid}-${Date.now()}`
+    const { root, pluginDir, binDir } = makeTempPlugin(pkgName)
+    const { bin, argsFile } = fakeCli(binDir, `Updated Server plugin "${pkgName}"`)
+    const config = path.join(root, "opencode.jsonc")
+    fs.writeFileSync(config, `{ "plugins": ["${pkgName}"] }\n`)
+    process.env.OPENCODE_CONFIG = config
+
+    try {
+      await run(pkgName, pluginDir, bin)
+      expect(fs.readFileSync(argsFile, "utf8").trim()).toBe(`plugin update ${pkgName}`)
+      expect(fs.readFileSync(config, "utf8")).toBe(`{ "plugins": ["${pkgName}"] }\n`)
+      expect(JSON.parse(fs.readFileSync(stateFile(pkgName), "utf8")).installed).toBe("1.1.0")
+    } finally {
+      fs.rmSync(stateFile(pkgName), { force: true })
+    }
+  })
+
+  test("does not stamp an install when v2 applied nothing", async () => {
+    const pkgName = `my-plugin-${process.pid}-${Date.now()}`
+    const { root, pluginDir, binDir } = makeTempPlugin(pkgName)
+    const { bin } = fakeCli(binDir, "No plugin updates available")
+    const config = path.join(root, "opencode.jsonc")
+    fs.writeFileSync(config, `{ "plugins": ["${pkgName}"] }\n`)
+    process.env.OPENCODE_CONFIG = config
+
+    try {
+      await run(pkgName, pluginDir, bin)
+      expect(JSON.parse(fs.readFileSync(stateFile(pkgName), "utf8")).installed).toBeUndefined()
+    } finally {
+      fs.rmSync(stateFile(pkgName), { force: true })
+    }
+  })
+})

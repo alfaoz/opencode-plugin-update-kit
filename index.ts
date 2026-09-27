@@ -6,8 +6,8 @@ import { spawn } from "child_process"
 export interface AutoUpdateOptions {
   /** npm package name (e.g. "my-plugin") */
   pkgName: string
-  /** opencode client from plugin context */
-  client: any
+  /** opencode client from plugin context (v1). v2 plugins have none. */
+  client?: any
   /**
    * Bun shell ($) from plugin context. Optional: the desktop app's server
    * runs on Node and passes no shell — the kit falls back to child_process.
@@ -49,6 +49,17 @@ export interface AutoUpdateOptions {
    * check on every startup.
    */
   checkIntervalMs?: number
+  /**
+   * Which opencode runtime loaded the plugin. Default: "v1".
+   *
+   * "v1" installs through `opencode plugin <pkg>@<ver> --force --global`.
+   * "v2" has no such command and treats exact version pins as immutable, so
+   * the kit moves the pin in the global config instead (v2 re-reads it and
+   * reloads the plugin without a restart); an unpinned entry is handed to
+   * v2's own `opencode plugin update`. v2 server plugins get no client, so
+   * notices go out as OS notifications.
+   */
+  runtime?: "v1" | "v2"
 }
 
 // ── Concurrency guard ──────────────────────────────────────────────
@@ -243,6 +254,36 @@ function spawnQuiet(
   })
 }
 
+function spawnOutput(
+  cmd: string,
+  args: string[],
+  extra?: { windowsVerbatimArguments?: boolean },
+): Promise<{ ok: boolean; stdout: string }> {
+  return new Promise((resolve) => {
+    try {
+      let stdout = ""
+      const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"], ...extra })
+      p.stdout?.on("data", (chunk) => (stdout += chunk))
+      p.on("error", () => resolve({ ok: false, stdout }))
+      p.on("close", (code) => resolve({ ok: code === 0, stdout }))
+    } catch {
+      resolve({ ok: false, stdout: "" })
+    }
+  })
+}
+
+/**
+ * The v2 CLI to run `plugin update` with. v2's server runs plugins
+ * in-process, so the running binary is the v2 CLI itself; otherwise use
+ * `opencode2`, which only v2 installs. Never a bare `opencode`: that may be
+ * v1, where `opencode plugin update` would install a package named "update".
+ */
+function v2Bin(explicit?: string): string {
+  if (explicit) return explicit
+  if (/^opencode/i.test(path.basename(process.execPath))) return process.execPath
+  return "opencode2"
+}
+
 /**
  * OS-native notification. Used under the desktop app, whose UI does not
  * render TUI toasts — the plugin host process runs as the user, so we can
@@ -283,7 +324,11 @@ async function osNotify(title: string, message: string): Promise<boolean> {
  * the new version. opencode installs config-pinned versions at startup, so
  * the update lands on the next restart.
  */
-function rewriteConfigSpec(pkgName: string, latest: string): boolean {
+function rewriteConfigSpec(
+  pkgName: string,
+  latest: string,
+  pinnedOnly = false,
+): boolean {
   const candidates: string[] = []
   if (process.env.OPENCODE_CONFIG) candidates.push(process.env.OPENCODE_CONFIG)
   const configHome =
@@ -295,7 +340,7 @@ function rewriteConfigSpec(pkgName: string, latest: string): boolean {
     try {
       if (!fs.existsSync(p)) continue
       const text = fs.readFileSync(p, "utf8")
-      const next = rewritePluginArraySpecs(text, pkgName, latest)
+      const next = rewritePluginArraySpecs(text, pkgName, latest, pinnedOnly)
       if (next === text) continue
       fs.writeFileSync(p, next)
       return true
@@ -392,17 +437,26 @@ function quoteString(value: string, quote: string): string {
   return `'${quoted.slice(1, -1).replace(/'/g, "\\'")}'`
 }
 
+// Rewrites the plugin's specs inside one plugin array. Handles every entry
+// shape both runtimes accept: "pkg@x" (both), ["pkg@x", {options}] (v1
+// `plugin`), and { "package": "pkg@x", "options": {...} } (v2 `plugins`).
+// With pinnedOnly, only exact x.y.z pins move: bare names, ranges and dist
+// tags are left for v2's own updater, which only touches those.
 function rewritePluginEntries(
   text: string,
   pkgName: string,
   latest: string,
+  pinnedOnly = false,
 ): string {
   let out = ""
   let cursor = 0
   let i = 0
-  let depth = 0
+  const stack: string[] = []
   const elementIndex: number[] = []
+  let key: string | null = null
   const specifier = `${pkgName}@${latest}`
+  const escaped = pkgName.replace(/[.*+?^$()|[\]\\{}]/g, "\\$&")
+  const pinned = new RegExp(`^${escaped}@\\d+\\.\\d+\\.\\d+$`)
 
   while (i < text.length) {
     if (text.startsWith("//", i)) {
@@ -418,28 +472,41 @@ function rewritePluginEntries(
 
     const quoted = readQuotedString(text, i)
     if (quoted) {
-      const isPluginSpec =
-        quoted.value === pkgName || quoted.value.startsWith(`${pkgName}@`)
+      const depth = stack.length
+      if (stack[depth - 1] === "{" && text[skipSpaceAndComments(text, quoted.end)] === ":") {
+        key = quoted.value
+        i = quoted.end
+        continue
+      }
+      const isPluginSpec = pinnedOnly
+        ? pinned.test(quoted.value)
+        : quoted.value === pkgName || quoted.value.startsWith(`${pkgName}@`)
       const isDirectPluginEntry = depth === 1
-      const isTupleSpecifier = depth === 2 && elementIndex[depth] === 0
-      if (isPluginSpec && (isDirectPluginEntry || isTupleSpecifier)) {
+      const isTupleSpecifier =
+        depth === 2 && stack[1] === "[" && elementIndex[depth] === 0
+      const isPackageField = depth === 2 && stack[1] === "{" && key === "package"
+      if (isPluginSpec && (isDirectPluginEntry || isTupleSpecifier || isPackageField)) {
         out += text.slice(cursor, i)
         out += quoteString(specifier, quoted.quote)
         cursor = quoted.end
       }
+      key = null
       i = quoted.end
       continue
     }
 
     const ch = text[i]
-    if (ch === "[") {
-      depth++
-      elementIndex[depth] = 0
-    } else if (ch === "]") {
-      elementIndex[depth] = 0
-      depth--
-    } else if (ch === "," && depth > 0) {
-      elementIndex[depth] = (elementIndex[depth] ?? 0) + 1
+    if (ch === "[" || ch === "{") {
+      stack.push(ch)
+      elementIndex[stack.length] = 0
+      key = null
+    } else if (ch === "]" || ch === "}") {
+      elementIndex[stack.length] = 0
+      stack.pop()
+      key = null
+    } else if (ch === "," && stack.length > 0) {
+      elementIndex[stack.length] = (elementIndex[stack.length] ?? 0) + 1
+      key = null
     }
     i++
   }
@@ -451,6 +518,7 @@ function rewritePluginArraySpecs(
   text: string,
   pkgName: string,
   latest: string,
+  pinnedOnly = false,
 ): string {
   let out = ""
   let cursor = 0
@@ -474,7 +542,8 @@ function rewritePluginArraySpecs(
       continue
     }
 
-    if (quoted.value !== "plugin") {
+    // v1 reads "plugin"; v2 reads both "plugin" and "plugins".
+    if (quoted.value !== "plugin" && quoted.value !== "plugins") {
       i = quoted.end
       continue
     }
@@ -500,6 +569,7 @@ function rewritePluginArraySpecs(
       text.slice(valueStart, valueEnd + 1),
       pkgName,
       latest,
+      pinnedOnly,
     )
     cursor = valueEnd + 1
     i = valueEnd + 1
@@ -516,7 +586,8 @@ function createLogger(
 ): (message: string, level?: string) => void {
   return (message, level = "info") => {
     try {
-      client?.app?.log?.({
+      if (typeof client?.app?.log !== "function") throw new Error("no client log")
+      client.app.log({
         body: { service: pkgName, level, message },
       })
     } catch {
@@ -559,6 +630,7 @@ export async function autoUpdate(
     skipInstallNotice = false,
     toastDuration = 86_400_000,
     checkIntervalMs = 5_000,
+    runtime = "v1",
   } = opts
 
   const log = opts.log ?? createLogger(client, pkgName)
@@ -610,6 +682,33 @@ export async function autoUpdate(
     if (state.installed === latest) return
 
     log(`update available: ${current} -> ${latest}`, "info")
+
+    if (runtime === "v2") {
+      // Exact pins are immutable to v2's own updater, so move the pin. v2
+      // re-reads the config and reloads the plugin; v1, which shares the
+      // file, installs the new pin at its next start.
+      let applied = rewriteConfigSpec(pkgName, latest, true)
+      if (!applied) {
+        // Unpinned: v2 owns the update, ask it to apply it now.
+        const spec = opencodeSpawnSpec(v2Bin(opts.opencodeBin), [
+          "plugin",
+          "update",
+          pkgName,
+        ])
+        const result = await spawnOutput(spec.cmd, spec.args, spec.options)
+        applied = result.ok && /Updated/.test(result.stdout)
+      }
+      if (!applied) {
+        log(`update failed: no pinned config entry and \`plugin update\` did not apply`, "warn")
+        return
+      }
+      writeState(pkgName, { ...state, lastCheck: Date.now(), installed: latest })
+      log(`update applied: ${current} -> ${latest}`, "info")
+      if (!opts.skipOsNotification) {
+        await osNotify("opencode", `${pkgName} updated to ${latest}`)
+      }
+      return
+    }
 
     const specifier = `${pkgName}@${latest}`
     const bin =
